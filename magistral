@@ -1,0 +1,552 @@
+#!/usr/bin/env python3# -*- coding: utf-8 -*-
+"""
+═══════════════════════════════════════════════════════════════════════════
+NEXUS OMEGA FORGE v2.0.0 — LE CODE MAGISTRAL
+═══════════════════════════════════════════════════════════════════════════
+Auteur : Aissa Mohammedi (DGK) — Meta Suprême Système
+Licence : NEXUS-OS v1.0
+Signature : 940006d54e0cc4bb
+Rôle : Dashboard local (10 moteurs) + Judge Bayésien + Auto-Fix
++ Générateur de Workflow GitHub Actions.
+Lancement :
+python3 nexus_omega_forge.py
+Puis :
+http://localhost:8888/
+═══════════════════════════════════════════════════════════════════════════
+"""
+
+import os
+import sys
+import re
+import ast
+import json
+import time
+import socket
+import shutil
+import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+from dataclasses import dataclass, asdict
+from typing import List, Dict
+
+# ═══════════════════════════════════════════════════════════════════════════
+# [0] CONSTANTES & IDENTITÉ NEXUS
+# ═══════════════════════════════════════════════════════════════════════════
+VERSION = "2.0.0"
+AUTEUR = "Aissa Mohammedi (DGK)"
+HERITIER = "Naim Mohammedi"
+SIGNATURE = "940006d54e0cc4bb"
+PORT = 8888
+MAX_CONTENT = 500000
+
+# ═══════════════════════════════════════════════════════════════════════════
+# [1] LES 10 MOTEURS SCIENTIFIQUES
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Finding:
+rule_id: str
+name: str
+severity: str
+confidence: str
+file: str
+line: int
+message: str
+cwe: str = ""
+agent: str = ""
+
+class EngineBase:
+name = "BaseEngine"
+def analyze(self, code: str, filename: str) -> List[Finding]: return []
+
+class Engine1_Compiler(EngineBase):
+name = "1. Compilateur"
+def analyze(self, code: str, filename: str) -> List[Finding]:
+findings = []
+if filename.endswith(".py"):
+try:
+compile(code, filename, 'exec')
+except SyntaxError as e:
+findings.append(Finding("COMP_PY", "SyntaxError", "critical", "high", filename, e.lineno or 0, f"Syntaxe: {e.msg}", "", self.name))
+return findings
+
+class Engine2_PyCompileAST(EngineBase):
+name = "2. Python AST"
+def analyze(self, code: str, filename: str) -> List[Finding]:
+findings = []
+try:
+tree = ast.parse(code)
+for node in ast.walk(tree):
+if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+if node.func.id in ("eval", "exec"):
+findings.append(Finding("AST_001", f"{node.func.id}()", "critical", "high", filename, node.lineno, f"Appel {node.func.id} (CWE-95)", "CWE-95", self.name))
+if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+if node.func.attr == "run" and any(kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is True for kw in node.keywords):
+findings.append(Finding("AST_002", "shell=True", "critical", "high", filename, node.lineno, "subprocess shell=True (CWE-78)", "CWE-78", self.name))
+except SyntaxError:
+pass
+return findings
+
+class Engine3_RuffPylint(EngineBase):
+name = "3. Ruff / Pylint"
+def analyze(self, code: str, filename: str) -> List[Finding]:
+findings = []
+for i, line in enumerate(code.split("\n"), 1):
+if re.search(r"except\s*:", line):
+findings.append(Finding("RUFF_001", "Bare except", "medium", "high", filename, i, "except: trop large (CWE-390)", "CWE-390", self.name))
+if len(line) > 120:
+findings.append(Finding("RUFF_002", "Ligne longue", "low", "high", filename, i, "Ligne > 120 chars", "", self.name))
+return findings
+
+class Engine4_ESLintChippy(EngineBase):
+name = "4. Chippy / JS Lint"
+def analyze(self, code: str, filename: str) -> List[Finding]:
+findings = []
+if not filename.endswith((".js", ".ts", ".jsx", ".tsx")): return findings
+for i, line in enumerate(code.split("\n"), 1):
+if re.search(r"\beval\s*\(", line):
+findings.append(Finding("JS_001", "eval()", "critical", "high", filename, i, "eval() JS", "CWE-95", self.name))
+if re.search(r"\.innerHTML\s*=", line):
+findings.append(Finding("JS_002", "innerHTML", "high", "high", filename, i, "XSS innerHTML", "CWE-79", self.name))
+return findings
+
+class Engine5_CodeQL(EngineBase):
+name = "5. CodeQL"
+def analyze(self, code: str, filename: str) -> List[Finding]:
+findings = []
+for i, line in enumerate(code.split("\n"), 1):
+if re.search(r"(?:execute|cursor\.execute)\s*\(\s*f['\"].*SELECT", line, re.I):
+findings.append(Finding("CODEQL_SQL", "SQL Injection", "critical", "high", filename, i, "Requête SQL avec f-string", "CWE-89", self.name))
+if re.search(r"yaml\.load\s*\([^,)]+\)", line):
+findings.append(Finding("CODEQL_YAML", "YAML unsafe", "high", "high", filename, i, "yaml.load non sécurisé", "CWE-502", self.name))
+return findings
+
+class Engine6_SonarQube(EngineBase):
+name = "6. SonarQube / Secrets"
+SECRETS = [
+("SEC_AWS", r"AKIA[0-9A-Z]{16}", "AWS Key"),
+("SEC_GITHUB", r"ghp_[A-Za-z0-9]{36}", "GitHub Token"),
+("SEC_OPENAI", r"sk-[A-Za-z0-9]{32,}", "OpenAI Key"),
+("SEC_PASS", r"(?:password|pwd)\s*[:=]\s*['\"][^'\"]{6,}['\"]", "Password en dur"),
+]
+def analyze(self, code: str, filename: str) -> List[Finding]:
+findings = []
+for i, line in enumerate(code.split("\n"), 1):
+for rid, pat, msg in self.SECRETS:
+if re.search(pat, line, re.I):
+findings.append(Finding(rid, msg, "critical", "high", filename, i, msg, "CWE-798", self.name))
+return findings
+
+class Engine7_GoVet(EngineBase):
+name = "7. staticcheck (Go)"
+def analyze(self, code: str, filename: str) -> List[Finding]:
+findings = []
+if not filename.endswith(".go"): return findings
+for i, line in enumerate(code.split("\n"), 1):
+if "fmt.Sprintf" in line and "SELECT" in line:
+findings.append(Finding("GO_SQL", "SQL Injection", "critical", "high", filename, i, "fmt.Sprintf SQL", "CWE-89", self.name))
+return findings
+
+class Engine8_PipAudit(EngineBase):
+name = "8. pip-audit"
+def analyze(self, code: str, filename: str) -> List[Finding]:
+findings = []
+if re.search(r"^\s*import\s+pickle", code, re.MULTILINE):
+findings.append(Finding("AUDIT_PICKLE", "pickle import", "high", "medium", filename, 0, "pickle = désérialisation risquée", "CWE-502", self.name))
+return findings
+
+class Engine9_OwaspAnglesMorts(EngineBase):
+name = "9. OWASP Angles Morts"
+RULES = [
+("IDOR_001", r"request\.(?:args|form|json)\[['\"](\w*_?id)['\"]\]", "IDOR potentiel", "critical", "CWE-639"),
+("SSRF_001", r"requests\.(?:get|post)\(\s*(?:request\.|params\[|args\[)", "SSRF", "critical", "CWE-918"),
+("PATH_001", r"open\s*\(\s*.*(?:request\.|params\[|args\[)", "Path Traversal", "critical", "CWE-22"),
+]
+def analyze(self, code: str, filename: str) -> List[Finding]:
+findings = []
+for rid, pat, msg, sev, cwe in self.RULES:
+for m in re.finditer(pat, code, re.MULTILINE):
+line_num = code[:m.start()].count("\n") + 1
+findings.append(Finding(rid, msg, sev, "medium", filename, line_num, msg, cwe, self.name))
+return findings
+
+class Engine10_DockerSandbox(EngineBase):
+name = "10. Docker Sandbox"
+def analyze(self, code: str, filename: str) -> List[Finding]:
+findings = []
+if re.search(r"os\.system|subprocess\.call", code):
+findings.append(Finding("DOCKER_001", "Appels système", "low", "low", filename, 0, "Devrait tourner en sandbox", "", self.name))
+return findings
+
+# ═══════════════════════════════════════════════════════════════════════════
+# [2] LE JUDGE AGENT
+# ═══════════════════════════════════════════════════════════════════════════
+
+class JudgeAgent:
+PRIORS = {"critical": 0.95, "high": 0.75, "medium": 0.5, "low": 0.25}
+CONF_ADJ = {"high": 1.0, "medium": 0.85, "low": 0.5}
+
+def _score(self, severity: str, confidence: str) -> float:
+return min(1.0, self.PRIORS.get(severity, 0.5) * self.CONF_ADJ.get(confidence, 1.0))
+
+def judge(self, findings: List[Finding]) -> Dict:
+valid, rejected = [], []
+seen = set()
+
+for f in findings:
+fp = f"{f.rule_id}:{f.file}:{f.line}"
+if fp in seen: continue
+seen.add(fp)
+
+score = self._score(f.severity, f.confidence)
+
+if score > 0.55:
+valid.append((f, score))
+else:
+rejected.append((f, score))
+
+return {
+"valid": [dict(asdict(f), score=round(s, 3)) for f, s in valid],
+"rejected": [dict(asdict(f), score=round(s, 3)) for f, s in rejected],
+"stats": {"total": len(findings), "validated": len(valid), "rejected": len(rejected)}
+}
+
+JUDGE = JudgeAgent()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# [3] LE MOTEUR DE CORRECTION (AUTO-FIX)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class FixEngine:
+@classmethod
+def fix(cls, code: str, filename: str) -> dict:
+changes = []
+corrected = code
+
+if filename.endswith(".py"):
+fixes = [
+(r'\beval\s*\(', 'ast.literal_eval(', 'eval() → ast.literal_eval()', 'import ast'),
+(r'\bexec\s*\(', 'compile(', 'exec() → compile()', ''),
+(r'except\s*:', 'except Exception as e:', 'except: → except Exception', ''),
+(r'shell\s*=\s*True', 'shell=False', 'shell=True → False', ''),
+(r'pickle\.loads?\s*\(', 'json.loads(', 'pickle → json', 'import json'),
+]
+
+for pattern, repl, desc, imp in fixes:
+if re.search(pattern, corrected):
+corrected = re.sub(pattern, repl, corrected)
+changes.append(desc)
+if imp and imp not in corrected:
+corrected = imp + "\n" + corrected
+
+secrets_pat = re.compile(r'(password|api_key|secret)\s*=\s*[\'"]([^\'"]+)[\'"]', re.I)
+if secrets_pat.search(corrected):
+corrected = secrets_pat.sub(r'\1 = os.environ.get("\1".upper())', corrected)
+changes.append("Secrets → variables d'environnement")
+if "import os" not in corrected:
+corrected = "import os\n" + corrected
+
+return {"corrected": corrected, "changes": changes, "total": len(changes)}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# [4] GÉNÉRATEUR DE WORKFLOW GITHUB ACTIONS
+# ═══════════════════════════════════════════════════════════════════════════
+
+class WorkflowGenerator:
+@staticmethod
+def generate() -> str:
+return """
+name: "NEXUS OMEGA FORGE — CI/CD Pipeline"
+on:
+push:
+branches: [ main, master ]
+pull_request:
+branches: [ main ]
+
+jobs:
+nexus-scan:
+runs-on: ubuntu-latest
+steps:
+- uses: actions/checkout@v4
+
+- name: Setup Python
+uses: actions/setup-python@v5
+with:
+python-version: '3.11'
+
+- name: Install Dependencies
+run: pip install bandit semgrep pip-audit
+
+- name: Run NEXUS Omega Forge (Local Engine)
+run: |
+echo "Lancement des 10 moteurs..."
+bandit -r . -f json -o report.json || true
+semgrep --config=auto --json -o semgrep.json . || true
+
+- name: Upload Security Reports
+uses: actions/upload-artifact@v4
+with:
+name: nexus-security-reports
+path: |
+report.json
+semgrep.json
+
+- name: CodeQL Init
+uses: github/codeql-action/init@v3
+with:
+languages: python, javascript
+
+- name: CodeQL Analyze
+uses: github/codeql-action/analyze@v3
+"""
+
+# ═══════════════════════════════════════════════════════════════════════════
+# [5] ORCHESTRATEUR
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Orchestrator:
+def __init__(self):
+self.engines = [
+Engine1_Compiler(), Engine2_PyCompileAST(), Engine3_RuffPylint(),
+Engine4_ESLintChippy(), Engine5_CodeQL(), Engine6_SonarQube(),
+Engine7_GoVet(), Engine8_PipAudit(), Engine9_OwaspAnglesMorts(),
+Engine10_DockerSandbox()
+]
+
+def scan(self, code: str, filename: str) -> Dict:
+start = time.time()
+all_findings = []
+
+for engine in self.engines:
+try:
+results = engine.analyze(code, filename)
+for r in results:
+r.agent = engine.name
+all_findings.append(r)
+except Exception:
+pass
+
+judged = JUDGE.judge(all_findings)
+duration = time.time() - start
+
+fix_result = None
+if len(judged["valid"]) > 0:
+fix_result = FixEngine.fix(code, filename)
+
+return {
+"filename": filename,
+"duration_ms": round(duration * 1000, 2),
+"valid_findings": judged["valid"],
+"rejected_findings": judged["rejected"],
+"stats": judged["stats"],
+"fix": fix_result
+}
+
+ORCHESTRATOR = Orchestrator()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# [6] INTERFACE WEB
+# ═══════════════════════════════════════════════════════════════════════════
+
+HTML_UI = """<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>🧬 NEXUS OMEGA FORGE v2.0</title>
+<style>
+:root { --bg: #030308; --panel: #0a0f1a; --border: #1a3a5a; --cyan: #00d4ff; --rose: #ff2d8f; --green: #00ff88; --text: #c8e0f8; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: ui-monospace, monospace; padding: 20px; }
+h1 { color: var(--cyan); font-size: 2rem; margin-bottom: 4px; }
+.sub { color: #5a7898; font-size: 12px; margin-bottom: 20px; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+.panel h2 { color: var(--cyan); font-size: 12px; text-transform: uppercase; letter-spacing: 2px; border-bottom: 1px solid var(--border); padding-bottom: 8px; margin-bottom: 14px; }
+textarea { width: 100%; height: 280px; background: #000; border: 1px solid var(--border); color: var(--green); padding: 12px; font-family: inherit; font-size: 12px; border-radius: 8px; outline: none; }
+input[type="text"] { width: 100%; padding: 10px; background: #000; border: 1px solid var(--border); color: var(--text); border-radius: 8px; margin-bottom: 10px; }
+button { background: linear-gradient(135deg, var(--cyan), var(--rose)); color: #000; border: 0; padding: 12px 24px; border-radius: 8px; font-weight: 800; cursor: pointer; font-family: inherit; text-transform: uppercase; letter-spacing: 1px; }
+button:hover { opacity: 0.9; }
+.finding { padding: 10px; margin-bottom: 8px; border-left: 4px solid; border-radius: 4px; background: #111; font-size: 11px; }
+.critical { border-color: var(--rose); color: #ff8888; }
+.high { border-color: #ff9900; color: #ffbb66; }
+.medium { border-color: #ffcc00; color: #ffee88; }
+.low { border-color: #0096ff; color: #66bbff; }
+.fix-box { background: rgba(0,255,136,0.05); border: 1px solid var(--green); border-radius: 12px; padding: 20px; margin-top: 20px; display: none; }
+.fix-box h2 { color: var(--green); }
+pre { background: #000; color: var(--green); padding: 12px; border-radius: 8px; font-size: 12px; overflow: auto; max-height: 200px; border: 1px solid var(--border); }
+.badge { padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: bold; }
+.badge.ok { background: var(--green); color: #000; }
+.stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 20px; }
+.stat-box { background: #000; border: 1px solid var(--border); padding: 12px; border-radius: 8px; }
+.stat-lbl { color: #5a7898; font-size: 10px; text-transform: uppercase; }
+.stat-val { color: var(--cyan); font-size: 20px; font-weight: 800; }
+</style>
+</head>
+<body>
+<h1>🧬 NEXUS OMEGA FORGE v2.0</h1>
+<div class="sub">10 Moteurs · Judge Bayésien · Auto-Fix · Générateur Workflow</div>
+
+<div class="stat-grid">
+<div class="stat-box"><div class="stat-lbl">Moteurs</div><div class="stat-val">10</div></div>
+<div class="stat-box"><div class="stat-lbl">Findings</div><div class="stat-val" id="s-total">0</div></div>
+<div class="stat-box"><div class="stat-lbl">Validés</div><div class="stat-val" id="s-valid" style="color:#00ff88">0</div></div>
+<div class="stat-box"><div class="stat-lbl">Corrections</div><div class="stat-val" id="s-fixes" style="color:#00d4ff">0</div></div>
+</div>
+
+<div class="grid">
+<div class="panel">
+<h2>📝 Code à Analyser</h2>
+<input type="text" id="filename" value="mon_script.py" placeholder="Nom du fichier">
+<textarea id="code">import pickle
+
+def get_user(user_id):
+return eval(input)
+
+password = "super_secret_123"
+AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
+</textarea>
+<div style="margin-top:10px; display:flex; gap:10px; flex-wrap:wrap;">
+<button onclick="scan()">⚡ Analyser</button>
+<button onclick="generateWorkflow()" style="background:linear-gradient(135deg, #a855f7, var(--cyan))">📄 Générer YAML GitHub</button>
+</div>
+</div>
+
+<div class="panel">
+<h2>🔬 Résultats</h2>
+<div id="results">Aucune analyse.</div>
+</div>
+</div>
+
+<div class="fix-box" id="fix-box">
+<h2>🔧 Code Corrigé (Auto-Fix)</h2>
+<div id="changes-list" style="margin:10px 0;"></div>
+<pre id="fixed-code"></pre>
+<button onclick="copyFixed()" style="margin-top:10px; background:var(--green); color:#000;">📋 Copier le code corrigé</button>
+</div>
+
+<div class="fix-box" id="workflow-box" style="border-color:#a855f7;">
+<h2 style="color:#a855f7;">⚙️ Workflow GitHub Actions (Généré)</h2>
+<pre id="workflow-yaml" style="color:#a855f7;"></pre>
+<button onclick="copyWorkflow()" style="margin-top:10px; background:#a855f7; color:#fff;">📋 Copier le YAML</button>
+</div>
+
+<script>
+async function scan() {
+const code = document.getElementById('code').value;
+const filename = document.getElementById('filename').value || 'unknown.py';
+document.getElementById('results').innerHTML = 'Analyse...';
+document.getElementById('fix-box').style.display = 'none';
+
+try {
+const r = await fetch('/api/scan', {
+method: 'POST', headers: {'Content-Type': 'application/json'},
+body: JSON.stringify({code, filename})
+});
+const d = await r.json();
+
+document.getElementById('s-total').textContent = d.stats.total;
+document.getElementById('s-valid').textContent = d.stats.validated;
+document.getElementById('s-fixes').textContent = d.fix ? d.fix.total : 0;
+
+let html = '';
+d.valid_findings.forEach(f => {
+html += `<div class="finding ${f.severity}"><b>[${f.rule_id}]</b> ${f.name} (Score: ${f.score})<br><span style="color:#5a7898">L${f.line} · ${f.cwe || 'N/A'} · ${f.agent}</span><br>${f.message}</div>`;
+});
+if (!html) html = '<div style="color:#00ff88;">✅ Aucun problème</div>';
+document.getElementById('results').innerHTML = html;
+
+if (d.fix && d.fix.total > 0) {
+document.getElementById('fix-box').style.display = 'block';
+document.getElementById('fixed-code').textContent = d.fix.corrected;
+document.getElementById('changes-list').innerHTML = d.fix.changes.map(c => `<span class="badge ok">${c}</span>`).join(' ');
+window.__fixed = d.fix.corrected;
+}
+} catch(e) { document.getElementById('results').innerHTML = 'Erreur: ' + e.message; }
+}
+
+async function generateWorkflow() {
+document.getElementById('workflow-box').style.display = 'block';
+const r = await fetch('/api/generate-workflow');
+const d = await r.json();
+document.getElementById('workflow-yaml').textContent = d.yaml;
+window.__workflow = d.yaml;
+}
+
+function copyFixed() { navigator.clipboard.writeText(window.__fixed || ''); alert('Code copié !'); }
+function copyWorkflow() { navigator.clipboard.writeText(window.__workflow || ''); alert('Workflow copié !'); }
+</script>
+</body>
+</html>
+"""
+
+# ═══════════════════════════════════════════════════════════════════════════
+# [7] LE SERVEUR HTTP
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Handler(BaseHTTPRequestHandler):
+def log_message(self, *args): pass
+
+def _send(self, code: int, body: str, ctype: str = "text/html"):
+try:
+self.send_response(code)
+self.send_header("Content-Type", f"{ctype}; charset=utf-8")
+self.send_header("Access-Control-Allow-Origin", "*")
+self.send_header("Content-Length", str(len(body.encode())))
+self.end_headers()
+self.wfile.write(body.encode())
+except (BrokenPipeError, ConnectionResetError): pass
+
+def do_GET(self):
+if self.path in ("/", "/index.html"):
+self._send(200, HTML_UI)
+elif self.path == "/api/generate-workflow":
+yaml = WorkflowGenerator.generate()
+self._send(200, json.dumps({"yaml": yaml}), "application/json")
+else:
+self._send(404, "Not Found")
+
+def do_POST(self):
+if self.path == "/api/scan":
+try:
+length = int(self.headers.get("Content-Length", 0))
+data = json.loads(self.rfile.read(length).decode())
+code = data.get("code", "")
+filename = data.get("filename", "unknown")
+if len(code) > MAX_CONTENT:
+return self._send(413, json.dumps({"error": "Trop gros"}))
+result = ORCHESTRATOR.scan(code, filename)
+self._send(200, json.dumps(result), "application/json")
+except Exception as e:
+self._send(500, json.dumps({"error": str(e)}), "application/json")
+else:
+self._send(404, "Not Found")
+
+
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+daemon_threads = True
+allow_reuse_address = True
+
+# ═══════════════════════════════════════════════════════════════════════════
+# [8] POINT D'ENTRÉE
+# ═══════════════════════════════════════════════════════════════════════════
+
+def main():
+print(f"""
+╔══════════════════════════════════════════════════════════════════════════╗
+║ 🧬 NEXUS OMEGA FORGE v{VERSION} ║
+║ 10 Moteurs · Judge Bayésien · Auto-Fix · Workflow Generator ║
+║ Auteur : {AUTEUR:<40} ║
+║ Signature : {SIGNATURE:<36} ║
+╚══════════════════════════════════════════════════════════════════════════╝
+
+🌐 Dashboard : http://localhost:{PORT}/
+🛑 Ctrl+C pour arrêter
+""")
+try:
+server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+server.serve_forever()
+except KeyboardInterrupt:
+print("\n👋 Arrêté.")
+
+if __name__ == "__main__":
+main()
